@@ -112,6 +112,7 @@ def main():
             ("Business", None),
             ("Stocks", "Business"),
             ("Earnings", "Business"),
+            ("Economics", "Business"),
             ("Science", None),
             ("Space", "Science"),
             ("Climate", "Science"),

@@ -110,6 +110,20 @@ The metric is detailed in the companion file [`STABILITY_METRIC.md`](STABILITY_M
 
 This measure can be calculated from historical odds obtained via the Data API or periodic snapshots and used to rank markets by predictability of their price movement.
 
+## Market Categories
+
+Gamma's market payloads currently leave `category`/`categories` empty. The real
+classification is carried by the tags of the parent event
+(`GET /events/{event_id}`). `scan_polymarket.py` maps those tag slugs onto the
+`PMKT.MARKET_CATEGORY` hierarchy (e.g. `soccer` → Sports/Soccer, election tags
+→ Politics/International Politics, Fed/economy tags → Business/Economics) and
+stores the resulting `category_id` in `MARKET_PM`. Existing rows can be repaired
+without adding new observations:
+
+```bash
+python3 scan_polymarket.py --backfill-categories
+```
+
 ## Related Pipelines
 
 - `scan_polymarket.py` populates `PMKT.MARKET_PM` and `PMKT.MARKET_PM_OPTIES`.

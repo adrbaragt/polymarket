@@ -12,6 +12,7 @@ The stability metric measures how smoothly the odds drift toward 100% at expiry
 
 import json
 import datetime
+import sys
 import time
 import math
 
@@ -37,8 +38,51 @@ SHORT_TERM_EXCLUDE_MINUTES = 60     # exclude markets closing sooner than this
 PRICE_HISTORY_DAYS = LOOKAHEAD_DAYS  # window used for the stability metric
 
 API_BASE = "https://gamma-api.polymarket.com/markets"
+EVENTS_API_BASE = "https://gamma-api.polymarket.com/events"
 CLOB_PRICE_HISTORY_BASE = "https://clob.polymarket.com/prices-history"
 PAGE_SIZE = 200
+
+# Map Polymarket event tag slugs (in priority order) to the (top, sub) names in
+# PMKT.MARKET_CATEGORY. Market-level `category` fields are null in the current
+# Gamma API, so the event's tags are the authoritative source for classification.
+CATEGORY_RULES = [
+    ("soccer", "Sports", "Soccer"),
+    ("basketball", "Sports", "Basketball"),
+    ("baseball", "Sports", "Baseball"),
+    ("sports", "Sports", None),
+    ("bitcoin", "Crypto", "Bitcoin"),
+    ("ethereum", "Crypto", "Ethereum"),
+    ("crypto", "Crypto", None),
+    ("movies", "Entertainment", "Movies"),
+    ("tv", "Entertainment", "TV"),
+    ("entertainment", "Entertainment", None),
+    ("space", "Science", "Space"),
+    ("climate", "Science", "Climate"),
+    ("science", "Science", None),
+    ("us-politics", "Politics", "US Politics"),
+    ("us-election", "Politics", "US Politics"),
+    ("united-states", "Politics", "US Politics"),
+    ("politics", "Politics", "International Politics"),
+    ("elections", "Politics", "International Politics"),
+    ("world-elections", "Politics", "International Politics"),
+    ("global-elections", "Politics", "International Politics"),
+    ("international-election-props", "Politics", "International Politics"),
+    ("mayoral-elections", "Politics", "International Politics"),
+    ("geopolitics", "Politics", "International Politics"),
+    ("middle-east", "Politics", "International Politics"),
+    ("fed", "Business", "Economics"),
+    ("fomc", "Business", "Economics"),
+    ("fed-rates", "Business", "Economics"),
+    ("economy", "Business", "Economics"),
+    ("economic-policy", "Business", "Economics"),
+    ("macro-indicators", "Business", "Economics"),
+    ("global-rates", "Business", "Economics"),
+    ("us-cpi", "Business", "Economics"),
+    ("stocks", "Business", "Stocks"),
+    ("earnings", "Business", "Earnings"),
+    ("business", "Business", None),
+]
+_event_tag_cache = {}
 
 
 # ---------- Database helpers ----------
@@ -145,32 +189,112 @@ def ensure_tables(cursor):
     )
 
 
-def get_or_create_category(cursor, cat_name):
-    """Return category_id for a top-level category, inserting it if missing."""
+def get_or_create_category(cursor, cat_name, parent_name=None):
+    """Return the category_id for a name, creating it under parent_name if needed."""
     if not cat_name:
         cat_name = "Uncategorized"
     cat_name = cat_name.strip()
 
-    cursor.execute(
-        "SELECT category_id FROM PMKT.MARKET_CATEGORY "
-        "WHERE name = :name AND parent_id IS NULL",
-        {"name": cat_name},
-    )
+    parent_id = None
+    parent_depth = -1  # so a top-level category gets depth 0
+    if parent_name:
+        cursor.execute(
+            "SELECT category_id, depth FROM PMKT.MARKET_CATEGORY "
+            "WHERE name = :name AND parent_id IS NULL",
+            {"name": parent_name},
+        )
+        row = cursor.fetchone()
+        if row:
+            parent_id, parent_depth = row
+        else:
+            parent_id = get_or_create_category(cursor, parent_name, None)
+            parent_depth = 0
+
+    if parent_id is None:
+        cursor.execute(
+            "SELECT category_id FROM PMKT.MARKET_CATEGORY "
+            "WHERE name = :name AND parent_id IS NULL",
+            {"name": cat_name},
+        )
+    else:
+        cursor.execute(
+            "SELECT category_id FROM PMKT.MARKET_CATEGORY "
+            "WHERE name = :name AND parent_id = :parent_id",
+            {"name": cat_name, "parent_id": parent_id},
+        )
     row = cursor.fetchone()
     if row:
-        return row[0]
+        return int(row[0])
 
     out_id = cursor.var(oracledb.NUMBER)
     cursor.execute(
         "INSERT INTO PMKT.MARKET_CATEGORY (name, parent_id, depth) "
-        "VALUES (:name, NULL, 0) "
+        "VALUES (:name, :parent_id, :depth) "
         "RETURNING category_id INTO :out_id",
-        {"name": cat_name, "out_id": out_id},
+        {
+            "name": cat_name,
+            "parent_id": parent_id,
+            "depth": parent_depth + 1,
+            "out_id": out_id,
+        },
     )
     val = out_id.getvalue()
     if isinstance(val, oracledb.Object):
         val = val.getvalue()
     return int(val[0])
+
+
+def fetch_event_tags(event_id):
+    """Fetch an event's tag slugs, cached by event id."""
+    if not event_id:
+        return []
+    key = str(event_id)
+    if key in _event_tag_cache:
+        return _event_tag_cache[key]
+
+    tags = []
+    try:
+        resp = requests.get(f"{EVENTS_API_BASE}/{key}", timeout=20)
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, list):
+                data = data[0] if data else {}
+            for tag in data.get("tags") or []:
+                slug = tag.get("slug") or tag.get("label") or ""
+                slug = str(slug).strip().lower()
+                if slug:
+                    tags.append(slug)
+    except Exception:
+        tags = []
+
+    _event_tag_cache[key] = tags
+    return tags
+
+
+def resolve_category(cursor, market):
+    """
+    Resolve a real category for a market.
+
+    Returns (category_id, is_real). Market-level category fields are currently
+    null, so the event's tags are used first. `is_real` is False only when the
+    fallback "Uncategorized" bucket is used.
+    """
+    events = market.get("events")
+    if isinstance(events, list) and events and isinstance(events[0], dict):
+        tag_set = set(fetch_event_tags(events[0].get("id")))
+        for slug, top, sub in CATEGORY_RULES:
+            if slug in tag_set:
+                return get_or_create_category(cursor, sub or top, top if sub else None), True
+
+    cat_name = market.get("category")
+    if not cat_name:
+        cats = market.get("categories")
+        if isinstance(cats, list) and cats:
+            cat_name = cats[0]
+    if cat_name:
+        return get_or_create_category(cursor, str(cat_name)), True
+
+    return get_or_create_category(cursor, "Uncategorized"), False
 
 
 # ---------- Polymarket API helpers ----------
@@ -284,7 +408,7 @@ def _parse_close_date(market):
 
 
 # ---------- Insertion helpers ----------
-def insert_market_static(cursor, market, category_id):
+def insert_market_static(cursor, market, category_id, category_is_real=True):
     """Insert the static MARKET_PM row. Returns True if inserted, False if skipped."""
     market_id = str(market.get("id"))
     question = (market.get("question") or "")[:4000]
@@ -333,6 +457,15 @@ def insert_market_static(cursor, market, category_id):
     except oracledb.IntegrityError as e:
         if "ORA-00001" not in str(e):
             raise
+        # Repair the category of a row that was stored before tag-based
+        # resolution existed. Never downgrade a real category on transient
+        # event-fetch failures.
+        if category_is_real:
+            cursor.execute(
+                "UPDATE PMKT.MARKET_PM SET category_id = :category_id "
+                "WHERE market_id = :market_id",
+                {"category_id": category_id, "market_id": market_id},
+            )
         return False  # already present
 
 
@@ -413,18 +546,11 @@ def main():
 
                 market_id = str(m.get("id"))
 
-                # Category resolution
-                cat_str = m.get("category")
-                if not cat_str:
-                    cats = m.get("categories")
-                    if isinstance(cats, list) and cats:
-                        cat_str = cats[0]
-                    else:
-                        cat_str = "Uncategorized"
-                category_id = get_or_create_category(cur, cat_str)
+                # Category resolution (event tags -> MARKET_CATEGORY hierarchy)
+                category_id, category_is_real = resolve_category(cur, m)
 
                 # Insert static row (dedup on market_id)
-                if insert_market_static(cur, m, category_id):
+                if insert_market_static(cur, m, category_id, category_is_real):
                     inserted_static += 1
 
                 # Resolve the token for the higher-priced outcome
@@ -487,6 +613,69 @@ def main():
             conn.close()
 
 
+def fetch_market_by_id(market_id):
+    """Fetch a single Gamma market by id."""
+    try:
+        resp = requests.get(API_BASE, params={"id": str(market_id)}, timeout=20)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if isinstance(data, list):
+            return data[0] if data else None
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def backfill_categories():
+    """Re-resolve categories for every row already in MARKET_PM."""
+    conn = None
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+
+        # Make sure the hierarchy exists (and add Economics under Business).
+        ensure_tables(cur)
+
+        cur.execute("SELECT market_id FROM PMKT.MARKET_PM ORDER BY market_id")
+        market_ids = [row[0] for row in cur.fetchall()]
+
+        updated = 0
+        unresolved = []
+        for market_id in market_ids:
+            market = fetch_market_by_id(market_id)
+            if not market:
+                unresolved.append((market_id, "market fetch failed"))
+                continue
+
+            category_id, is_real = resolve_category(cur, market)
+            if not is_real:
+                unresolved.append((market_id, "no matching event tag"))
+                continue
+
+            cur.execute(
+                "UPDATE PMKT.MARKET_PM SET category_id = :category_id "
+                "WHERE market_id = :market_id",
+                {"category_id": category_id, "market_id": market_id},
+            )
+            if cur.rowcount:
+                updated += 1
+
+        conn.commit()
+        print(f"Backfilled categories for {updated}/{len(market_ids)} markets.")
+        if unresolved:
+            print("Unresolved:")
+            for market_id, reason in unresolved:
+                print(f"  {market_id}: {reason}")
+    except Exception:
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if conn:
+            conn.close()
+
+
 if __name__ == "__main__":
     try:
         import dateutil.parser  # noqa: F401
@@ -494,4 +683,8 @@ if __name__ == "__main__":
         import subprocess
         import sys
         subprocess.check_call([sys.executable, "-m", "pip", "install", "python-dateutil"])
-    main()
+
+    if "--backfill-categories" in sys.argv:
+        backfill_categories()
+    else:
+        main()
