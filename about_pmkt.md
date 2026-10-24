@@ -102,3 +102,11 @@ These SDKs wrap the Gamma, CLOB, and Data APIs, handling authentication, request
 ## Conclusion
 
 Polymarket combines the mechanics of prediction markets with blockchain infrastructure to offer a global, permissionless trading platform. Its suite of APIs enables developers to build trading bots, analytics tools, and integrations that interact seamlessly with the market's order book and data streams.
+## Stability Metric for Odds Evolution
+
+To assess how smoothly a market’s probability drifts toward its assumed eventual outcome (100 % at expiry), we propose a **Stability Metric** based on the deviation of observed probabilities from an ideal linear path. 
+
+The metric is detailed in the companion file [`STABILITY_METRIC.md`](STABILITY_METRIC.md). In short, it computes the normalized root‑mean‑square deviation (NRMSD) between the actual probability time‑series and a reference line that increases linearly from the first observed probability to 100 % at the market’s `endDate`. A stability score of `S = 1 – NRMSD` ranges from 0 (highly erratic) to 1 (perfectly smooth drift).
+
+This measure can be calculated from historical odds obtained via the Data API or periodic snapshots and used to rank markets by predictability of their price movement.
+
