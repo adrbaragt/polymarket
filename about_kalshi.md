@@ -84,10 +84,10 @@ markets closing within 60 minutes, and a probability band of 80.0 % to 99.1 %.
 Kalshi publishes an extremely large number of auto-generated markets (sports
 props, player thresholds, ...); a single 5-day scan can exceed 120,000 open
 markets. Most of them have zero open interest. `MIN_OPEN_INTEREST_USD`
-(default `10000`) therefore acts as a data-quality floor: a market must have at
+(default `50000`) therefore acts as a data-quality floor: a market must have at
 least that much open interest in USD before it is stored. This keeps a run
-bounded while remaining far more permissive than the ~$100k+ liquidity markets
-the Polymarket scan typically selects.
+bounded while remaining comparable to (and slightly more permissive than) the
+~$100k+ liquidity markets the Polymarket scan typically selects.
 
 ## Database schema
 

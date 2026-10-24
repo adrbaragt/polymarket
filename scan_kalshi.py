@@ -46,9 +46,10 @@ PRICE_HISTORY_DAYS = LOOKAHEAD_DAYS  # window used for the stability metric
 # Kalshi generates a very large number of auto-created markets (sports props,
 # player thresholds, ...), most of which have no open interest at all.  A single
 # unfiltered scan can exceed 120k markets.  Requiring a minimum open interest
-# expressed in USD keeps the scan meaningful and bounded, while still being far
-# more permissive than the ~$100k+ liquidity markets the Polymarket scan finds.
-MIN_OPEN_INTEREST_USD = 10000.0
+# expressed in USD keeps the scan meaningful and bounded, while still being
+# comparable to (and slightly more permissive than) the ~$100k+ liquidity
+# markets the Polymarket scan finds.
+MIN_OPEN_INTEREST_USD = 50000.0
 
 KALSHI_BASE = "https://external-api.kalshi.com/trade-api/v2"
 PAGE_LIMIT = 1000
