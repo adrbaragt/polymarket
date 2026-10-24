@@ -30,7 +30,7 @@ def get_connection():
     return oracledb.connect(user=DB_USER, password=DB_PASSWORD, dsn=DB_DSN)
 
 def ensure_tables(cursor):
-    # Create category table (hierarchical)
+    # ---- Category table (hierarchical) ----
     cursor.execute("""
     BEGIN
         EXECUTE IMMEDIATE q'[
@@ -49,7 +49,8 @@ def ensure_tables(cursor):
             END IF;
     END;
     """)
-    # Create market data table (without raw_json to avoid size issues)
+
+    # ---- Market data table ----
     cursor.execute("""
     BEGIN
         EXECUTE IMMEDIATE q'[
@@ -59,6 +60,9 @@ def ensure_tables(cursor):
                 question         VARCHAR2(4000) NOT NULL,
                 url              VARCHAR2(2000),
                 probability_pct  NUMBER(5,2) NOT NULL,
+                outcome_label    VARCHAR2(100),
+                event_label      VARCHAR2(200),
+                liquidity        NUMBER,
                 close_date       TIMESTAMP NOT NULL,
                 category_id      NUMBER NOT NULL REFERENCES PMKT.MARKET_CATEGORY(category_id),
                 extracted_at     TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL
@@ -71,7 +75,33 @@ def ensure_tables(cursor):
             END IF;
     END;
     """)
-    # Optional index
+    # Add columns if table already existed (liquidity, event_label, outcome_label)
+    # outcome_label
+    try:
+        cursor.execute("""
+        ALTER TABLE PMKT.POLYMARKET_MARKETS ADD (outcome_label VARCHAR2(100))
+        """)
+    except oracledb.DatabaseError as e:
+        if "ORA-01430" not in str(e):
+            raise
+    # event_label
+    try:
+        cursor.execute("""
+        ALTER TABLE PMKT.POLYMARKET_MARKETS ADD (event_label VARCHAR2(200))
+        """)
+    except oracledb.DatabaseError as e:
+        if "ORA-01430" not in str(e):
+            raise
+    # liquidity
+    try:
+        cursor.execute("""
+        ALTER TABLE PMKT.POLYMARKET_MARKETS ADD (liquidity NUMBER)
+        """)
+    except oracledb.DatabaseError as e:
+        if "ORA-01430" not in str(e):
+            raise
+
+    # ---- Optional index on close_date ----
     cursor.execute("""
     BEGIN
         EXECUTE IMMEDIATE 'CREATE INDEX PMKT.IDX_POLYMARKET_CLOSE ON PMKT.POLYMARKET_MARKETS(close_date)';
@@ -88,7 +118,6 @@ def get_or_create_category(cursor, cat_name):
     if not cat_name:
         cat_name = "Uncategorized"
     cat_name = cat_name.strip()
-    # Try to find
     cursor.execute(
         "SELECT category_id FROM PMKT.MARKET_CATEGORY WHERE name = :name AND parent_id IS NULL",
         {"name": cat_name}
@@ -116,38 +145,45 @@ def insert_market(cursor, market):
     question = market.get("question", "")[:4000]
     slug = market.get("slug")
     url = f"https://polymarket.com/market/{slug}" if slug else None
-    # probability: higher of outcomePrices
-    outcome_prices = market.get("outcomePrices", "[]")
+
+    # ---- Probability and outcome label ----
+    outcome_prices_raw = market.get("outcomePrices", "[]")
+    outcomes_raw = market.get("outcomes", "[]")
     try:
-        prices = json.loads(outcome_prices) if isinstance(outcome_prices, str) else outcome_prices
-        if not isinstance(prices, list):
-            prices = []
-        prob = max([float(p) for p in prices]) if prices else 0.0
+        prices = json.loads(outcome_prices_raw) if isinstance(outcome_prices_raw, str) else outcome_prices_raw
+        outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+        if not isinstance(prices, list) or not isinstance(outcomes, list) or len(prices) == 0:
+            prob = 0.0
+            outcome_label = None
+        else:
+            # Find index of max price
+            max_idx = max(range(len(prices)), key=lambda i: float(prices[i]))
+            prob = float(prices[max_idx])
+            outcome_label = str(outcomes[max_idx]) if max_idx < len(outcomes) else None
     except Exception:
         prob = 0.0
+        outcome_label = None
+
     probability_pct = prob * 100.0
-    # close date
+
+    # ---- Close date ----
     end_date_str = market.get("endDate")
     try:
-        # Expect format like 2026-10-24T07:50:00Z
-        # Make it offset-aware UTC
         if end_date_str.endswith('Z'):
             end_date_str = end_date_str[:-1] + '+00:00'
         close_date = datetime.datetime.fromisoformat(end_date_str)
     except Exception:
-        # fallback: try parsing with dateutil if available
         try:
             from dateutil import parser
             close_date = parser.isoparse(market.get("endDate"))
         except Exception:
             close_date = None
     if close_date is None:
-        # skip if we can't parse date
-        return
-    # Ensure timezone aware (convert to UTC naive for storage as TIMESTAMP)
+        return  # skip if we can't parse date
     if close_date.tzinfo is not None:
         close_date = close_date.astimezone(datetime.timezone.utc).replace(tzinfo=None)
-    # category
+
+    # ---- Category ----
     cat_str = market.get("category")
     if not cat_str:
         cats = market.get("categories")
@@ -156,19 +192,42 @@ def insert_market(cursor, market):
         else:
             cat_str = "Uncategorized"
     category_id = get_or_create_category(cursor, cat_str)
-    # Insert
+
+    # ---- Liquidity (USD amount) ----
+    liquidity_str = market.get("liquidity")
+    try:
+        liquidity = float(liquidity_str) if liquidity_str is not None else None
+    except Exception:
+        liquidity = None
+
+    # ---- Event label ----
+    event_label = None
+    events = market.get("events")
+    if isinstance(events, list) and len(events) > 0:
+        # take first event's title
+        first_event = events[0]
+        if isinstance(first_event, dict):
+            event_label = first_event.get("title")
+        elif isinstance(first_event, str):
+            event_label = first_event
+    # If still None, maybe use resolutionSource as fallback? Keep None.
+
+    # ---- Insert ----
     cursor.execute(
         """
         INSERT INTO PMKT.POLYMARKET_MARKETS
-        (market_id, question, url, probability_pct, close_date, category_id)
+        (market_id, question, url, probability_pct, outcome_label, event_label, liquidity, close_date, category_id)
         VALUES
-        (:market_id, :question, :url, :probability_pct, :close_date, :category_id)
+        (:market_id, :question, :url, :probability_pct, :outcome_label, :event_label, :liquidity, :close_date, :category_id)
         """,
         {
             "market_id": market_id,
             "question": question,
             "url": url,
             "probability_pct": probability_pct,
+            "outcome_label": outcome_label,
+            "event_label": event_label,
+            "liquidity": liquidity,
             "close_date": close_date,
             "category_id": category_id
         }
@@ -185,11 +244,9 @@ def fetch_markets_page(offset, end_date_min, end_date_max):
     try:
         resp = requests.get(API_BASE, params=params, timeout=20)
         if resp.status_code != 200:
-            # treat as no more data
             return []
         return resp.json()
     except Exception:
-        # any error -> treat as no more data
         return []
 
 def main():
@@ -205,13 +262,20 @@ def main():
         conn.autocommit = False
         cur = conn.cursor()
         ensure_tables(cur)
-        conn.commit()
+        # Truncate table to drop previous information
+        try:
+            cur.execute("TRUNCATE TABLE PMKT.POLYMARKET_MARKETS")
+            conn.commit()
+            print("Truncated PMKT.POLYMARKET_MARKETS")
+        except Exception as e:
+            # If table doesn't exist, ensure_tables would have created it, but just in case
+            conn.rollback()
+            raise
         
         now = datetime.datetime.now(datetime.timezone.utc)
         max_close = now + datetime.timedelta(days=LOOKAHEAD_DAYS)
         min_close = now + datetime.timedelta(minutes=SHORT_TERM_EXCLUDE_MINUTES)
         
-        # Format timestamps for API (ISO 8601 with Z)
         end_date_min = now.strftime("%Y-%m-%dT%H:%M:%SZ")
         end_date_max = max_close.strftime("%Y-%m-%dT%H:%M:%SZ")
         
@@ -257,7 +321,6 @@ def main():
             conn.commit()
             offset += PAGE_SIZE
             print(f"  Offset {offset}: scanned {len(batch)} markets from this page, total inserted {inserted}")
-            # If we got less than PAGE_SIZE, we've reached the end of data for this window
             if len(batch) < PAGE_SIZE:
                 break
         
