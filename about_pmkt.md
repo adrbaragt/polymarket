@@ -124,6 +124,18 @@ without adding new observations:
 python3 scan_polymarket.py --backfill-categories
 ```
 
+## Views
+
+`create_views.sql` (run via `python3 create_views.py`) creates two convenience
+views:
+
+- `PMKT.V_PM_MARKETS` — `MARKET_PM` joined to `MARKET_PM_OPTIES`, with the
+  resolved `category` and `parent_category`.
+- `PMKT.V_KL_MARKETS` — `MARKET_KL` joined to `MARKET_KL_OPTIES`.
+
+Both are one row per market per observation, and include markets that have no
+observations yet (observation columns are then `NULL`).
+
 ## Related Pipelines
 
 - `scan_polymarket.py` populates `PMKT.MARKET_PM` and `PMKT.MARKET_PM_OPTIES`.
