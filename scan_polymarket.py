@@ -19,12 +19,11 @@ DB_DSN = "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=adb.eu-frankfurt-1.oraclecl
 
 # Script parameters (provided by user)
 PROBABILITY_THRESHOLD = 80.0   # percent
-LOOKAHEAD_DAYS = 3
+LOOKAHEAD_DAYS = 5
 SHORT_TERM_EXCLUDE_MINUTES = 60  # exclude markets closing sooner than this
 
 API_BASE = "https://gamma-api.polymarket.com/markets"
 PAGE_SIZE = 200  # adjust as needed; max maybe 500
-MAX_PAGES = 20   # safety limit
 
 # ---------- Helper functions ----------
 def get_connection():
@@ -45,12 +44,12 @@ def ensure_tables(cursor):
         ]';
     EXCEPTION
         WHEN OTHERS THEN
-            IF SQLCODE != -00955 THEN  -- ORA-00955: name is already used by an existing object
+            IF SQLCODE != -00955 THEN
                 RAISE;
             END IF;
     END;
     """)
-    # Create market data table
+    # Create market data table (without raw_json to avoid size issues)
     cursor.execute("""
     BEGIN
         EXECUTE IMMEDIATE q'[
@@ -62,8 +61,7 @@ def ensure_tables(cursor):
                 probability_pct  NUMBER(5,2) NOT NULL,
                 close_date       TIMESTAMP NOT NULL,
                 category_id      NUMBER NOT NULL REFERENCES PMKT.MARKET_CATEGORY(category_id),
-                extracted_at     TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL,
-                raw_json         CLOB
+                extracted_at     TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL
             )
         ]';
     EXCEPTION
@@ -158,15 +156,13 @@ def insert_market(cursor, market):
         else:
             cat_str = "Uncategorized"
     category_id = get_or_create_category(cursor, cat_str)
-    # raw json (optional)
-    raw_json = json.dumps(market, ensure_ascii=False)
     # Insert
     cursor.execute(
         """
         INSERT INTO PMKT.POLYMARKET_MARKETS
-        (market_id, question, url, probability_pct, close_date, category_id, raw_json)
+        (market_id, question, url, probability_pct, close_date, category_id)
         VALUES
-        (:market_id, :question, :url, :probability_pct, :close_date, :category_id, :raw_json)
+        (:market_id, :question, :url, :probability_pct, :close_date, :category_id)
         """,
         {
             "market_id": market_id,
@@ -174,20 +170,27 @@ def insert_market(cursor, market):
             "url": url,
             "probability_pct": probability_pct,
             "close_date": close_date,
-            "category_id": category_id,
-            "raw_json": raw_json
+            "category_id": category_id
         }
     )
 
-def fetch_markets_page(offset):
+def fetch_markets_page(offset, end_date_min, end_date_max):
     params = {
         "closed": "false",
         "limit": PAGE_SIZE,
         "offset": offset,
+        "end_date_min": end_date_min,
+        "end_date_max": end_date_max,
     }
-    resp = requests.get(API_BASE, params=params, timeout=20)
-    resp.raise_for_status()
-    return resp.json()
+    try:
+        resp = requests.get(API_BASE, params=params, timeout=20)
+        if resp.status_code != 200:
+            # treat as no more data
+            return []
+        return resp.json()
+    except Exception:
+        # any error -> treat as no more data
+        return []
 
 def main():
     start_time = datetime.datetime.now(datetime.timezone.utc)
@@ -208,11 +211,15 @@ def main():
         max_close = now + datetime.timedelta(days=LOOKAHEAD_DAYS)
         min_close = now + datetime.timedelta(minutes=SHORT_TERM_EXCLUDE_MINUTES)
         
+        # Format timestamps for API (ISO 8601 with Z)
+        end_date_min = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_date_max = max_close.strftime("%Y-%m-%dT%H:%M:%SZ")
+        
         inserted = 0
         scanned = 0
         offset = 0
-        for page in range(MAX_PAGES):
-            batch = fetch_markets_page(offset)
+        while True:
+            batch = fetch_markets_page(offset, end_date_min, end_date_max)
             if not batch:
                 break
             scanned += len(batch)
@@ -230,10 +237,7 @@ def main():
                         continue
                 if end_dt.tzinfo is None:
                     end_dt = end_dt.replace(tzinfo=datetime.timezone.utc)
-                # Apply lookahead window
-                if end_dt < now or end_dt > max_close:
-                    continue
-                # Exclude short term
+                # Exclude short term (< min_close)
                 if end_dt < min_close:
                     continue
                 # probability check
@@ -252,9 +256,10 @@ def main():
                 inserted += 1
             conn.commit()
             offset += PAGE_SIZE
-            print(f"  Page {page+1}: {len(batch)} markets scanned, total inserted {inserted}")
+            print(f"  Offset {offset}: scanned {len(batch)} markets from this page, total inserted {inserted}")
+            # If we got less than PAGE_SIZE, we've reached the end of data for this window
             if len(batch) < PAGE_SIZE:
-                break  # no more data
+                break
         
         elapsed = (datetime.datetime.now(datetime.timezone.utc) - start_time).total_seconds()
         print(f"\nScan finished.")
