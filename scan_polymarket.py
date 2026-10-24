@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Scan Polymarket Gamma API for markets meeting criteria and store them in PMKT schema.
+Includes stability metric based on historical price drift.
 """
 
 import os
@@ -10,6 +11,7 @@ import datetime
 import time
 import requests
 import oracledb
+import math
 
 # ---------- Configuration ----------
 # Connection details (same as STK/STK_TRD)
@@ -22,8 +24,10 @@ PROBABILITY_THRESHOLD = 80.0   # percent (lower bound)
 MAX_PROBABILITY = 99.1         # percent (upper bound, exclusive? we treat > MAX_PROBABILITY as exclude)
 LOOKAHEAD_DAYS = 5
 SHORT_TERM_EXCLUDE_MINUTES = 60  # exclude markets closing sooner than this
+PRICE_HISTORY_DAYS = LOOKAHEAD_DAYS  # use same window for price history
 
 API_BASE = "https://gamma-api.polymarket.com/markets"
+CLOB_PRICE_HISTORY_BASE = "https://clob.polymarket.com/prices-history"
 PAGE_SIZE = 200  # adjust as needed; max maybe 500
 
 # ---------- Helper functions ----------
@@ -64,6 +68,7 @@ def ensure_tables(cursor):
                 outcome_label    VARCHAR2(100),
                 event_label      VARCHAR2(200),
                 liquidity        NUMBER,
+                stability_score  NUMBER,  -- 0-1, higher = more stable
                 close_date       TIMESTAMP NOT NULL,
                 category_id      NUMBER NOT NULL REFERENCES PMKT.MARKET_CATEGORY(category_id),
                 extracted_at     TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL
@@ -76,7 +81,7 @@ def ensure_tables(cursor):
             END IF;
     END;
     """)
-    # Add columns if table already existed (liquidity, event_label, outcome_label)
+    # Add columns if table already existed (outcome_label, event_label, liquidity, stability_score)
     # outcome_label
     try:
         cursor.execute("""
@@ -97,6 +102,14 @@ def ensure_tables(cursor):
     try:
         cursor.execute("""
         ALTER TABLE PMKT.POLYMARKET_MARKETS ADD (liquidity NUMBER)
+        """)
+    except oracledb.DatabaseError as e:
+        if "ORA-01430" not in str(e):
+            raise
+    # stability_score
+    try:
+        cursor.execute("""
+        ALTER TABLE PMKT.POLYMARKET_MARKETS ADD (stability_score NUMBER)
         """)
     except oracledb.DatabaseError as e:
         if "ORA-01430" not in str(e):
@@ -140,8 +153,93 @@ def get_or_create_category(cursor, cat_name):
         val = val.getvalue()
     return int(val[0])
 
-def insert_market(cursor, market):
-    """Insert a single market record; assumes category resolved."""
+def fetch_markets_page(offset, end_date_min, end_date_max):
+    params = {
+        "closed": "false",
+        "limit": PAGE_SIZE,
+        "offset": offset,
+        "end_date_min": end_date_min,
+        "end_date_max": end_date_max,
+    }
+    try:
+        resp = requests.get(API_BASE, params=params, timeout=20)
+        if resp.status_code != 200:
+            return []
+        return resp.json()
+    except Exception:
+        return []
+
+def get_price_history(token_id, start_ts, end_ts):
+    """Fetch price history for a token (asset_id) from CLOB API."""
+    params = {
+        "market": token_id,
+        "startTs": start_ts,
+        "endTs": end_ts,
+    }
+    try:
+        resp = requests.get(CLOB_PRICE_HISTORY_BASE, params=params, timeout=20)
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+        # Expect {"history": [{"t": timestamp, "p": price}, ...]}
+        history = data.get("history", [])
+        # Ensure sorted by t
+        history.sort(key=lambda x: x["t"])
+        return history
+    except Exception:
+        return []
+
+def compute_stability_score(history, p0_obs, t0, T):
+    """
+    Compute stability score based on deviation from ideal linear drift.
+    history: list of dicts with keys 't' (unix timestamp) and 'p' (price 0-1)
+    p0_obs: observed probability at t0 (should match history[0]['p'] approx)
+    t0: start timestamp (int)
+    T: end timestamp (int) expiry
+    Returns score in [0,1] or None if insufficient data.
+    """
+    if len(history) < 2:
+        return None
+    if T <= t0:
+        return None
+    # Use observed p0 from first history point to avoid mismatch
+    p0 = float(history[0]["p"])
+    # If p0_obs provided, we could use it; but we'll use history p0.
+    # Compute ideal line: p_ideal(t) = p0 + (1 - p0)*(t - t0)/(T - t0)
+    total_interval = T - t0
+    sum_sq = 0.0
+    count = 0
+    for point in history:
+        t = float(point["t"])
+        p = float(point["p"])
+        if t < t0 or t > T:
+            # skip points outside window (shouldn't happen if we filtered)
+            continue
+        ideal = p0 + (1.0 - p0) * (t - t0) / total_interval
+        diff = p - ideal
+        sum_sq += diff * diff
+        count += 1
+    if count == 0:
+        return None
+    rmsd = math.sqrt(sum_sq / count)
+    # Normalize by max possible deviation (1 - p0)
+    max_dev = 1.0 - p0
+    if max_dev <= 0:
+        nrmsd = 0.0
+    else:
+        nrmsd = rmsd / max_dev
+        if nrmsd > 1:
+            nrmsd = 1.0
+    stability = 1.0 - nrmsd
+    # Clamp
+    if stability < 0:
+        stability = 0.0
+    if stability > 1:
+        stability = 1.0
+    return stability
+
+def insert_market(cursor, market, now_ts):
+    """Insert a single market record; computes stability score."""
     market_id = str(market.get("id"))
     question = market.get("question", "")[:4000]
     slug = market.get("slug")
@@ -157,7 +255,6 @@ def insert_market(cursor, market):
             prob = 0.0
             outcome_label = None
         else:
-            # Find index of max price
             max_idx = max(range(len(prices)), key=lambda i: float(prices[i]))
             prob = float(prices[max_idx])
             outcome_label = str(outcomes[max_idx]) if max_idx < len(outcomes) else None
@@ -205,21 +302,62 @@ def insert_market(cursor, market):
     event_label = None
     events = market.get("events")
     if isinstance(events, list) and len(events) > 0:
-        # take first event's title
         first_event = events[0]
         if isinstance(first_event, dict):
             event_label = first_event.get("title")
         elif isinstance(first_event, str):
             event_label = first_event
-    # If still None, maybe use resolutionSource as fallback? Keep None.
+
+    # ---- Stability score ----
+    stability_score = None
+    # Determine token ID for the outcome with higher price (the one we used for prob)
+    # We need to map outcome index to token ID from clobTokenIds
+    clob_token_ids_raw = market.get("clobTokenIds", "[]")
+    try:
+        token_ids = json.loads(clob_token_ids_raw) if isinstance(clob_token_ids_raw, str) else clob_token_ids_raw
+        if not isinstance(token_ids, list) or len(token_ids) < 2:
+            token_ids = []
+    except Exception:
+        token_ids = []
+    # Determine which token corresponds to higher price outcome
+    # Assume token_ids order matches outcomes order (first token -> first outcome)
+    higher_idx = None
+    if len(token_ids) == len(outcomes) and len(outcomes) > 0:
+        # recompute max idx just in case
+        try:
+            prices_list = json.loads(outcome_prices_raw) if isinstance(outcome_prices_raw, str) else outcome_prices_raw
+            if isinstance(prices_list, list):
+                higher_idx = max(range(len(prices_list)), key=lambda i: float(prices_list[i]))
+            else:
+                higher_idx = None
+        except Exception:
+            higher_idx = None
+    else:
+        higher_idx = None
+    if higher_idx is not None and 0 <= higher_idx < len(token_ids):
+        token_id = str(token_ids[higher_idx])
+        # Fetch price history for last PRICE_HISTORY_DAYS days
+        end_ts = int(now_ts)
+        start_ts = end_ts - PRICE_HISTORY_DAYS * 86400
+        history = get_price_history(token_id, start_ts, end_ts)
+        if history:
+            # Use first observed price from history as p0, t0 from first history point
+            t0 = float(history[0]["t"])
+            p0 = float(history[0]["p"])
+            T = float(close_date.timestamp())
+            stability_score = compute_stability_score(history, p0, t0, T)
+        else:
+            stability_score = None
+    else:
+        stability_score = None
 
     # ---- Insert ----
     cursor.execute(
         """
         INSERT INTO PMKT.POLYMARKET_MARKETS
-        (market_id, question, url, probability_pct, outcome_label, event_label, liquidity, close_date, category_id)
+        (market_id, question, url, probability_pct, outcome_label, event_label, liquidity, stability_score, close_date, category_id)
         VALUES
-        (:market_id, :question, :url, :probability_pct, :outcome_label, :event_label, :liquidity, :close_date, :category_id)
+        (:market_id, :question, :url, :probability_pct, :outcome_label, :event_label, :liquidity, :stability_score, :close_date, :category_id)
         """,
         {
             "market_id": market_id,
@@ -229,33 +367,20 @@ def insert_market(cursor, market):
             "outcome_label": outcome_label,
             "event_label": event_label,
             "liquidity": liquidity,
+            "stability_score": stability_score,
             "close_date": close_date,
             "category_id": category_id
         }
     )
 
-def fetch_markets_page(offset, end_date_min, end_date_max):
-    params = {
-        "closed": "false",
-        "limit": PAGE_SIZE,
-        "offset": offset,
-        "end_date_min": end_date_min,
-        "end_date_max": end_date_max,
-    }
-    try:
-        resp = requests.get(API_BASE, params=params, timeout=20)
-        if resp.status_code != 200:
-            return []
-        return resp.json()
-    except Exception:
-        return []
-
 def main():
     start_time = datetime.datetime.now(datetime.timezone.utc)
+    now_ts = int(start_time.timestamp())
     print(f"Starting scan at {start_time.isoformat()}")
     print(f"Threshold: probability >= {PROBABILITY_THRESHOLD}% and <= {MAX_PROBABILITY}%")
     print(f"Lookahead: {LOOKAHEAD_DAYS} days")
     print(f"Exclude markets closing sooner than {SHORT_TERM_EXCLUDE_MINUTES} minutes")
+    print(f"Using price history window: {PRICE_HISTORY_DAYS} days for stability metric")
     
     conn = None
     try:
@@ -269,7 +394,6 @@ def main():
             conn.commit()
             print("Truncated PMKT.POLYMARKET_MARKETS")
         except Exception as e:
-            # If table doesn't exist, ensure_tables would have created it, but just in case
             conn.rollback()
             raise
         
@@ -317,7 +441,7 @@ def main():
                 if prob * 100.0 < PROBABILITY_THRESHOLD or prob * 100.0 > MAX_PROBABILITY:
                     continue
                 # Insert
-                insert_market(cur, m)
+                insert_market(cur, m, now_ts)
                 inserted += 1
             conn.commit()
             offset += PAGE_SIZE
