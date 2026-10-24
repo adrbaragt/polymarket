@@ -1,0 +1,622 @@
+#!/usr/bin/env python3
+"""
+Scan Kalshi markets via the public Trade API and store them in a normalized
+schema that mirrors the Polymarket tables:
+
+  - MARKET_KL         : static market attributes (one row per market)
+  - MARKET_KL_OPTIES  : time-varying observations (prob, stability, liquidity)
+
+The stability metric measures how smoothly the chosen outcome's probability
+drifts toward 100% at expiry (see STABILITY_METRIC.md).
+
+Kalshi API notes
+----------------
+* Base URL: https://external-api.kalshi.com/trade-api/v2
+* Public market data needs no authentication.
+* Market prices are binary Yes/No, quoted in dollars (0.00 - 1.00).
+* Historical prices are available through the candlesticks endpoint:
+  GET /series/{series_ticker}/markets/{ticker}/candlesticks
+"""
+
+import datetime
+import math
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+import requests
+import oracledb
+
+# ---------- Configuration ----------
+DB_USER = "PMKT"
+DB_PASSWORD = "1Chaise-chien-soucoupe"
+DB_DSN = (
+    "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)"
+    "(HOST=adb.eu-frankfurt-1.oraclecloud.com)(PORT=1522))"
+    "(CONNECT_DATA=(SERVER=DEDICATED)"
+    "(SERVICE_NAME=gf75342b9701342_nrkx9a0bppxkie5b_tp.adb.oraclecloud.com)))"
+)
+
+PROBABILITY_THRESHOLD = 80.0        # percent (lower bound)
+MAX_PROBABILITY = 99.1              # percent (upper bound)
+LOOKAHEAD_DAYS = 5                  # look-ahead window for market close dates
+SHORT_TERM_EXCLUDE_MINUTES = 60     # exclude markets closing sooner than this
+PRICE_HISTORY_DAYS = LOOKAHEAD_DAYS  # window used for the stability metric
+
+# Kalshi generates a very large number of auto-created markets (sports props,
+# player thresholds, ...), most of which have no open interest at all.  A single
+# unfiltered scan can exceed 120k markets.  Requiring a minimum open interest
+# expressed in USD keeps the scan meaningful and bounded, while still being far
+# more permissive than the ~$100k+ liquidity markets the Polymarket scan finds.
+MIN_OPEN_INTEREST_USD = 10000.0
+
+KALSHI_BASE = "https://external-api.kalshi.com/trade-api/v2"
+PAGE_LIMIT = 1000
+CANDLE_INTERVAL = 60  # minutes
+MAX_WORKERS = 8       # parallel per-market history/order-book requests
+
+
+# ---------- HTTP helper ----------
+_thread_local = threading.local()
+
+
+def _session():
+    """One requests.Session per worker thread (connection pooling)."""
+    session = getattr(_thread_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        _thread_local.session = session
+    return session
+
+
+def _get(url, params=None):
+    """GET with a small retry/backoff for rate limits and transient errors."""
+    for attempt in range(4):
+        try:
+            resp = _session().get(url, params=params, timeout=25)
+            if resp.status_code == 200:
+                return resp.json()
+            if resp.status_code in (429, 500, 502, 503, 504):
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            return None
+        except Exception:
+            time.sleep(1.0 * (attempt + 1))
+    return None
+
+
+# ---------- Database helpers ----------
+def get_connection():
+    return oracledb.connect(user=DB_USER, password=DB_PASSWORD, dsn=DB_DSN)
+
+
+def _create_table(cursor, ddl):
+    cursor.execute(
+        "BEGIN\n"
+        f"    EXECUTE IMMEDIATE q'[\n{ddl}\n]';\n"
+        "EXCEPTION\n"
+        "    WHEN OTHERS THEN\n"
+        "        IF SQLCODE != -00955 THEN\n"
+        "            RAISE;\n"
+        "        END IF;\n"
+        "END;"
+    )
+
+
+def _add_column(cursor, table, column_ddl):
+    try:
+        cursor.execute(f"ALTER TABLE {table} ADD ({column_ddl})")
+    except oracledb.DatabaseError as e:
+        if "ORA-01430" not in str(e):
+            raise
+
+
+def _create_index(cursor, ddl):
+    cursor.execute(
+        "BEGIN\n"
+        f"    EXECUTE IMMEDIATE '{ddl}';\n"
+        "EXCEPTION\n"
+        "    WHEN OTHERS THEN\n"
+        "        IF SQLCODE != -00955 THEN\n"
+        "            RAISE;\n"
+        "        END IF;\n"
+        "END;"
+    )
+
+
+def ensure_tables(cursor):
+    # Static market table
+    _create_table(
+        cursor,
+        """
+        CREATE TABLE PMKT.MARKET_KL (
+            market_id     VARCHAR2(200) PRIMARY KEY,
+            market_name   VARCHAR2(4000),
+            close_date    TIMESTAMP,
+            event_label   VARCHAR2(1000),
+            outcome_label VARCHAR2(100),
+            category      VARCHAR2(200)
+        )
+        """,
+    )
+    _add_column(cursor, "PMKT.MARKET_KL", "event_label VARCHAR2(1000)")
+    _add_column(cursor, "PMKT.MARKET_KL", "outcome_label VARCHAR2(100)")
+    _add_column(cursor, "PMKT.MARKET_KL", "category VARCHAR2(200)")
+
+    # Time-varying observations table
+    _create_table(
+        cursor,
+        """
+        CREATE TABLE PMKT.MARKET_KL_OPTIES (
+            optie_id        NUMBER GENERATED BY DEFAULT ON NULL AS IDENTITY PRIMARY KEY,
+            market_id       VARCHAR2(200) REFERENCES PMKT.MARKET_KL(market_id),
+            prob_pct        NUMBER(5,2),
+            extraction_date TIMESTAMP DEFAULT SYSTIMESTAMP,
+            stability       NUMBER,
+            liquidity       NUMBER
+        )
+        """,
+    )
+    _add_column(cursor, "PMKT.MARKET_KL_OPTIES", "stability NUMBER")
+    _add_column(cursor, "PMKT.MARKET_KL_OPTIES", "liquidity NUMBER")
+
+    _create_index(cursor, "CREATE INDEX PMKT.IDX_MARKET_KL_CLOSE ON PMKT.MARKET_KL(close_date)")
+    _create_index(
+        cursor,
+        "CREATE INDEX PMKT.IDX_KL_OPTIES_MARKET ON PMKT.MARKET_KL_OPTIES(market_id)",
+    )
+
+
+# ---------- Parsing helpers ----------
+def parse_dollars(value):
+    """Parse a Kalshi dollar string (e.g. '0.5600') into a float."""
+    if value is None:
+        return None
+    try:
+        return float(str(value).replace(",", "").strip())
+    except Exception:
+        return None
+
+
+def parse_timestamp(value):
+    """Parse an ISO-8601 timestamp from Kalshi into a naive UTC datetime."""
+    if not value:
+        return None
+    try:
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        dt = datetime.datetime.fromisoformat(value)
+    except Exception:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def current_yes_price(market):
+    """Return the current YES probability implied by the market."""
+    bid = parse_dollars(market.get("yes_bid_dollars"))
+    ask = parse_dollars(market.get("yes_ask_dollars"))
+    last = parse_dollars(market.get("last_price_dollars"))
+
+    if bid is not None and ask is not None and bid > 0 and ask > 0 and bid <= ask:
+        return (bid + ask) / 2.0
+    if last is not None and last > 0:
+        return last
+    if bid is not None and ask is not None and bid <= ask:
+        return (bid + ask) / 2.0
+    return 0.0
+
+
+def candle_yes_price(candle):
+    """Extract the YES probability from a candlestick."""
+    price = candle.get("price") or {}
+    if isinstance(price, dict) and price:
+        for key in ("close_dollars", "mean_dollars", "open_dollars"):
+            val = price.get(key)
+            if val is not None and val != "":
+                p = parse_dollars(val)
+                if p is not None:
+                    return p
+
+    bid = parse_dollars((candle.get("yes_bid") or {}).get("close_dollars"))
+    ask = parse_dollars((candle.get("yes_ask") or {}).get("close_dollars"))
+    if bid is not None and ask is not None and bid > 0 and ask > 0 and bid <= ask:
+        return (bid + ask) / 2.0
+    if bid is not None and bid > 0:
+        return bid
+    if ask is not None and ask > 0:
+        return ask
+    return None
+
+
+def open_interest_usd(market):
+    """Open interest expressed in USD (contracts x notional value)."""
+    oi = parse_dollars(market.get("open_interest_fp")) or 0.0
+    nv = parse_dollars(market.get("notional_value_dollars")) or 1.0
+    return oi * nv
+
+
+# ---------- Metric ----------
+def compute_stability_score(history, t0, T):
+    """
+    Stability score = 1 - NRMSD, where NRMSD is the RMS deviation between the
+    observed probability path and an ideal linear path from p(t0) to 1.0 at
+    expiry T. Returns None if there is not enough data.
+    """
+    if len(history) < 2:
+        return None
+    if T <= t0:
+        return None
+
+    p0 = float(history[0]["p"])
+    total_interval = T - t0
+    sum_sq = 0.0
+    count = 0
+    for point in history:
+        t = float(point["t"])
+        p = float(point["p"])
+        if t < t0 or t > T:
+            continue
+        ideal = p0 + (1.0 - p0) * (t - t0) / total_interval
+        diff = p - ideal
+        sum_sq += diff * diff
+        count += 1
+
+    if count == 0:
+        return None
+
+    rmsd = math.sqrt(sum_sq / count)
+    max_dev = 1.0 - p0
+    if max_dev <= 0:
+        nrmsd = 0.0
+    else:
+        nrmsd = min(1.0, rmsd / max_dev)
+
+    stability = 1.0 - nrmsd
+    return max(0.0, min(1.0, stability))
+
+
+# ---------- Kalshi data helpers ----------
+_event_cache = {}
+_event_lock = threading.Lock()
+
+
+def fetch_event(event_ticker):
+    """Return {title, series_ticker, category} for an event (cached, thread-safe)."""
+    if not event_ticker:
+        return {"title": event_ticker, "series_ticker": None, "category": None}
+    with _event_lock:
+        cached = _event_cache.get(event_ticker)
+    if cached is not None:
+        return cached
+
+    data = _get(f"{KALSHI_BASE}/events/{event_ticker}")
+    if data and "event" in data:
+        ev = data["event"]
+        result = {
+            "title": ev.get("title") or event_ticker,
+            "series_ticker": ev.get("series_ticker"),
+            "category": ev.get("category"),
+        }
+    else:
+        result = {"title": event_ticker, "series_ticker": None, "category": None}
+    with _event_lock:
+        _event_cache[event_ticker] = result
+    return result
+
+
+def fetch_candlesticks(series_ticker, ticker, start_ts, end_ts):
+    """Fetch hourly candlesticks for a market."""
+    if not series_ticker:
+        return []
+    data = _get(
+        f"{KALSHI_BASE}/series/{series_ticker}/markets/{ticker}/candlesticks",
+        params={
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "period_interval": CANDLE_INTERVAL,
+        },
+    )
+    if not data:
+        return []
+    candles = data.get("candlesticks", []) or []
+    candles.sort(key=lambda c: c.get("end_period_ts", 0))
+    return candles
+
+
+def fetch_liquidity(ticker):
+    """
+    Compute liquidity in USD from the order book: sum(price * size) over all
+    resting levels on both the YES and NO sides.
+    Returns None if the order book could not be fetched.
+    """
+    data = _get(f"{KALSHI_BASE}/markets/{ticker}/orderbook")
+    if not data:
+        return None
+
+    book = data.get("orderbook_fp") or data.get("orderbook") or {}
+    total = 0.0
+    found = False
+
+    # orderbook_fp uses dollar strings; the legacy orderbook uses cents.
+    for side_key, divisor in (
+        ("yes_dollars", 1.0),
+        ("no_dollars", 1.0),
+        ("yes", 100.0),
+        ("no", 100.0),
+    ):
+        levels = book.get(side_key)
+        if not isinstance(levels, list):
+            continue
+        for level in levels:
+            if isinstance(level, list) and len(level) >= 2:
+                price = parse_dollars(level[0])
+                size = parse_dollars(level[1])
+                if price is not None and size is not None:
+                    total += (price / divisor) * size
+                    found = True
+
+    return total if found else 0.0
+
+
+def fetch_stability_and_liquidity(
+    market, series_ticker, outcome_label, start_ts, end_ts, expiry_ts, oi_usd
+):
+    """
+    Fetch the two data-heavy per-market inputs. Designed to run in a worker
+    thread: it only performs HTTP reads and pure computation, never DB writes.
+    """
+    market_id = market.get("ticker")
+
+    candles = fetch_candlesticks(series_ticker, market_id, start_ts, end_ts)
+    history = []
+    for candle in candles:
+        ts = candle.get("end_period_ts")
+        if ts is None:
+            continue
+        yes_prob = candle_yes_price(candle)
+        if yes_prob is None:
+            continue
+        p = yes_prob if outcome_label == "Yes" else (1.0 - yes_prob)
+        history.append({"t": float(ts), "p": float(p)})
+
+    stability = None
+    if history:
+        stability = compute_stability_score(history, history[0]["t"], float(expiry_ts))
+
+    liquidity = fetch_liquidity(market_id)
+    if liquidity is None:
+        liquidity = oi_usd
+
+    return stability, liquidity
+
+
+# ---------- Insertion helpers ----------
+def insert_static_market(cursor, market, event_label, category, outcome_label):
+    """Insert the static MARKET_KL row (deduplicated on market_id)."""
+    market_id = market.get("ticker")
+    if not market_id:
+        return False
+    market_name = market.get("title") or market.get("yes_sub_title") or market_id
+    market_name = str(market_name)[:4000]
+    event_label = (event_label or "")[:1000]
+    category = (category or "")[:200]
+    close_date = parse_timestamp(market.get("close_time"))
+    if close_date is None:
+        return False
+
+    try:
+        cursor.execute(
+            """
+            INSERT INTO PMKT.MARKET_KL
+            (market_id, market_name, close_date, event_label, outcome_label, category)
+            VALUES
+            (:market_id, :market_name, :close_date, :event_label, :outcome_label, :category)
+            """,
+            {
+                "market_id": market_id,
+                "market_name": market_name,
+                "close_date": close_date,
+                "event_label": event_label,
+                "outcome_label": outcome_label,
+                "category": category,
+            },
+        )
+        return True
+    except oracledb.IntegrityError as e:
+        if "ORA-00001" not in str(e):
+            raise
+        return False  # already present
+
+
+def insert_observation(cursor, market_id, prob_pct, stability, liquidity, extraction_dt):
+    cursor.execute(
+        """
+        INSERT INTO PMKT.MARKET_KL_OPTIES
+        (market_id, prob_pct, extraction_date, stability, liquidity)
+        VALUES
+        (:market_id, :prob_pct, :extraction_date, :stability, :liquidity)
+        """,
+        {
+            "market_id": market_id,
+            "prob_pct": prob_pct,
+            "extraction_date": extraction_dt,
+            "stability": stability,
+            "liquidity": liquidity,
+        },
+    )
+
+
+# ---------- Main ----------
+def main():
+    start_time = datetime.datetime.now(datetime.timezone.utc)
+    now_ts = int(start_time.timestamp())
+    extraction_dt = start_time.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+
+    min_close_ts = now_ts + SHORT_TERM_EXCLUDE_MINUTES * 60
+    max_close_ts = now_ts + LOOKAHEAD_DAYS * 86400
+
+    print(f"Starting Kalshi scan at {start_time.isoformat()}")
+    print(f"Threshold: probability >= {PROBABILITY_THRESHOLD}% and <= {MAX_PROBABILITY}%")
+    print(f"Minimum open interest: ${MIN_OPEN_INTEREST_USD:,.0f} USD")
+    print(f"Lookahead: {LOOKAHEAD_DAYS} days")
+    print(f"Exclude markets closing sooner than {SHORT_TERM_EXCLUDE_MINUTES} minutes")
+    print(f"Stability metric uses price history window: {PRICE_HISTORY_DAYS} days")
+
+    conn = None
+    try:
+        conn = get_connection()
+        conn.autocommit = False
+        cur = conn.cursor()
+        ensure_tables(cur)
+
+        # Incremental: no truncation. Static markets are deduplicated; every
+        # run appends fresh observation rows.
+        inserted_static = 0
+        inserted_opties = 0
+        scanned = 0
+        cursor_token = ""
+
+        start_ts = now_ts - PRICE_HISTORY_DAYS * 86400
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            while True:
+                params = {
+                    "min_close_ts": min_close_ts,
+                    "max_close_ts": max_close_ts,
+                    "limit": PAGE_LIMIT,
+                    "mve_filter": "exclude",
+                }
+                if cursor_token:
+                    params["cursor"] = cursor_token
+
+                data = _get(f"{KALSHI_BASE}/markets", params=params)
+                if not data:
+                    break
+
+                markets = data.get("markets", []) or []
+                if not markets:
+                    break
+                scanned += len(markets)
+
+                # 1) Cheap filtering on the page payload.
+                candidates = []
+                for m in markets:
+                    status = (m.get("status") or "").lower()
+                    if status not in ("active", "open"):
+                        continue
+
+                    market_id = m.get("ticker")
+                    if not market_id:
+                        continue
+
+                    close_date = parse_timestamp(m.get("close_time"))
+                    if close_date is None:
+                        continue
+                    expiry_ts = close_date.replace(
+                        tzinfo=datetime.timezone.utc
+                    ).timestamp()
+                    if expiry_ts < min_close_ts:
+                        continue
+
+                    yes_price = current_yes_price(m)
+                    prob = max(yes_price, 1.0 - yes_price)
+                    if (
+                        prob * 100.0 < PROBABILITY_THRESHOLD
+                        or prob * 100.0 > MAX_PROBABILITY
+                    ):
+                        continue
+
+                    oi_usd = open_interest_usd(m)
+                    if oi_usd < MIN_OPEN_INTEREST_USD:
+                        continue
+
+                    candidates.append(
+                        {
+                            "market": m,
+                            "prob_pct": prob * 100.0,
+                            "outcome_label": "Yes" if yes_price >= 0.5 else "No",
+                            "expiry_ts": expiry_ts,
+                            "oi_usd": oi_usd,
+                            "event_ticker": m.get("event_ticker") or "",
+                        }
+                    )
+
+                # 2) Resolve event metadata once per event, in parallel.
+                unique_events = sorted(
+                    {c["event_ticker"] for c in candidates if c["event_ticker"]}
+                )
+                if unique_events:
+                    list(executor.map(fetch_event, unique_events))
+
+                # 3) Fetch price history and order-book liquidity in parallel.
+                futures = [
+                    executor.submit(
+                        fetch_stability_and_liquidity,
+                        c["market"],
+                        fetch_event(c["event_ticker"])["series_ticker"],
+                        c["outcome_label"],
+                        start_ts,
+                        now_ts,
+                        c["expiry_ts"],
+                        c["oi_usd"],
+                    )
+                    for c in candidates
+                ]
+
+                # 4) Insert serially: the Oracle connection is not thread-safe.
+                for candidate, future in zip(candidates, futures):
+                    market = candidate["market"]
+                    event = fetch_event(candidate["event_ticker"])
+                    if insert_static_market(
+                        cur,
+                        market,
+                        event["title"],
+                        event["category"],
+                        candidate["outcome_label"],
+                    ):
+                        inserted_static += 1
+
+                    stability, liquidity = future.result()
+                    insert_observation(
+                        cur,
+                        market.get("ticker"),
+                        candidate["prob_pct"],
+                        stability,
+                        liquidity,
+                        extraction_dt,
+                    )
+                    inserted_opties += 1
+
+                conn.commit()
+                cursor_token = data.get("cursor") or ""
+                print(
+                    f"  Page: scanned {len(markets)} markets, "
+                    f"qualified {len(candidates)}, "
+                    f"static rows {inserted_static}, opties rows {inserted_opties}"
+                )
+                if not cursor_token:
+                    break
+                if len(markets) < PAGE_LIMIT:
+                    break
+
+        elapsed = (datetime.datetime.now(datetime.timezone.utc) - start_time).total_seconds()
+        print("\nScan finished.")
+        print(f"  Markets scanned: {scanned}")
+        print(f"  Static market rows inserted: {inserted_static}")
+        print(f"  Observation rows inserted: {inserted_opties}")
+        print(f"  Elapsed time: {elapsed:.1f}s")
+
+    except Exception as e:
+        print(f"Error: {e}")
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if conn:
+            conn.close()
+
+
+if __name__ == "__main__":
+    main()

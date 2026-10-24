@@ -1,12 +1,12 @@
-# Stability Metric for Polymarket Odds
+# Stability Metric for Prediction-Market Odds
 
 ## Goal
 Quantify how smoothly the market probability drifts from its current value toward the assumed eventual outcome of 100 % at the market’s expiration date.
 
 ## Assumptions
 * The “true” probability of the event will converge to 100 % by the market’s `endDate` (expiry).
-* We have a time‑series of observed probabilities \(p(t_i)\) (e.g., from the Polymarket Data‑API or from periodic snapshots).
-* Let \(t_0\) be the timestamp of the first observation and \(T\) the market’s expiry (`endDate`).
+* We have a time‑series of observed probabilities \(p(t_i)\) (e.g., from the Polymarket CLOB/Data API, Kalshi candlesticks, or periodic snapshots).
+* Let \(t_0\) be the timestamp of the first observation and \(T\) the market’s expiry (`endDate` for Polymarket, `close_time` for Kalshi).
 
 ## Ideal (reference) path
 If the odds were to move perfectly linearly toward 100 %, the reference probability at any time \(t\) would be:
@@ -60,7 +60,7 @@ If the final observation is before expiry, we can optionally extrapolate the las
 ## Usage
 * Compute the metric for each market to rank them by “smoothness of odds movement”.
 * Combine with other factors (liquidity, volume, etc.) to filter markets that not only meet a probability threshold but also exhibit predictable drift.
-* The metric can be stored as a derived column (e.g., `stability_score`) in the `PMKT.POLYMARKET_MARKETS` table if historical odds are persisted.
+* The metric is stored as the `stability` column of `PMKT.MARKET_PM_OPTIES` (Polymarket) and `PMKT.MARKET_KL_OPTIES` (Kalshi).
 
 ## References
 * Concept adapted from forecasting error measures (MAE, RMSE) applied to probability paths.

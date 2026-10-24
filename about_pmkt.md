@@ -110,3 +110,10 @@ The metric is detailed in the companion file [`STABILITY_METRIC.md`](STABILITY_M
 
 This measure can be calculated from historical odds obtained via the Data API or periodic snapshots and used to rank markets by predictability of their price movement.
 
+## Related Pipelines
+
+- `scan_polymarket.py` populates `PMKT.MARKET_PM` and `PMKT.MARKET_PM_OPTIES`.
+- `scan_kalshi.py` mirrors the same logic for Kalshi and populates
+  `PMKT.MARKET_KL` and `PMKT.MARKET_KL_OPTIES`. See `about_kalshi.md` for the
+  Kalshi API notes and the table definitions.
+
