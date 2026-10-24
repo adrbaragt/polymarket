@@ -373,12 +373,9 @@ def main():
         cur = conn.cursor()
         ensure_tables(cur)
 
-        # Flush tables (start fresh)
-        cur.execute("TRUNCATE TABLE PMKT.MARKET_PM_OPTIES")
-        cur.execute("TRUNCATE TABLE PMKT.MARKET_PM")
-        conn.commit()
-        print("Truncated PMKT.MARKET_PM and PMKT.MARKET_PM_OPTIES")
-
+        # Incremental mode: do NOT truncate. New markets are inserted into
+        # MARKET_PM (deduplicated on market_id), and every run appends a fresh
+        # observation row into MARKET_PM_OPTIES.
         now = datetime.datetime.now(datetime.timezone.utc)
         max_close = now + datetime.timedelta(days=LOOKAHEAD_DAYS)
         min_close = now + datetime.timedelta(minutes=SHORT_TERM_EXCLUDE_MINUTES)
