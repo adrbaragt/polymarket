@@ -18,7 +18,8 @@ DB_PASSWORD = "1Chaise-chien-soucoupe"
 DB_DSN = "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=adb.eu-frankfurt-1.oraclecloud.com)(PORT=1522))(CONNECT_DATA=(SERVER=DEDICATED)(SERVICE_NAME=gf75342b9701342_nrkx9a0bppxkie5b_tp.adb.oraclecloud.com)))"
 
 # Script parameters (provided by user)
-PROBABILITY_THRESHOLD = 80.0   # percent
+PROBABILITY_THRESHOLD = 80.0   # percent (lower bound)
+MAX_PROBABILITY = 99.1         # percent (upper bound, exclusive? we treat > MAX_PROBABILITY as exclude)
 LOOKAHEAD_DAYS = 5
 SHORT_TERM_EXCLUDE_MINUTES = 60  # exclude markets closing sooner than this
 
@@ -252,7 +253,7 @@ def fetch_markets_page(offset, end_date_min, end_date_max):
 def main():
     start_time = datetime.datetime.now(datetime.timezone.utc)
     print(f"Starting scan at {start_time.isoformat()}")
-    print(f"Threshold: probability >= {PROBABILITY_THRESHOLD}%")
+    print(f"Threshold: probability >= {PROBABILITY_THRESHOLD}% and <= {MAX_PROBABILITY}%")
     print(f"Lookahead: {LOOKAHEAD_DAYS} days")
     print(f"Exclude markets closing sooner than {SHORT_TERM_EXCLUDE_MINUTES} minutes")
     
@@ -304,7 +305,7 @@ def main():
                 # Exclude short term (< min_close)
                 if end_dt < min_close:
                     continue
-                # probability check
+                # probability check: lower bound and upper bound
                 outcome_prices = m.get("outcomePrices", "[]")
                 try:
                     prices = json.loads(outcome_prices) if isinstance(outcome_prices, str) else outcome_prices
@@ -313,7 +314,7 @@ def main():
                     prob = max([float(p) for p in prices]) if prices else 0.0
                 except Exception:
                     prob = 0.0
-                if prob * 100.0 < PROBABILITY_THRESHOLD:
+                if prob * 100.0 < PROBABILITY_THRESHOLD or prob * 100.0 > MAX_PROBABILITY:
                     continue
                 # Insert
                 insert_market(cur, m)
